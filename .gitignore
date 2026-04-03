@@ -1,0 +1,42 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv*/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Database & vector store
+*.db
+*.sqlite
+.chroma/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Workspace temp dirs
+aita_*/
+
+# Reports
+reports/*.json
+reports/*.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

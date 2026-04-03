@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show anthropic langchain-anthropic tree-sitter gitpython pygithub allure-pytest 2>/dev/null | grep -E \"^\\(Name|Version\\)\")",
+      "Bash(node --version && npm --version && npx --version 2>/dev/null)",
+      "Bash(python3 -c \"import sys; data=open\\(r'C:\\\\Users\\\\fkanzaoui\\\\.claude\\\\projects\\\\C--Users-fkanzaoui-project-intern\\\\e7abeb10-6112-49c7-b6b3-4fcb8dd0e55a\\\\tool-results\\\\toolu_01RBst1i7qh8zaTcfy4vWGD1.json','r',encoding='utf-8'\\).read\\(\\); import json; parsed=json.loads\\(data\\); text=parsed[0]['text']; print\\(text[:8000]\\)\")",
+      "Bash(py -c \"import json; data=open\\(r'C:/Users/fkanzaoui/.claude/projects/C--Users-fkanzaoui-project-intern/e7abeb10-6112-49c7-b6b3-4fcb8dd0e55a/tool-results/toolu_01RBst1i7qh8zaTcfy4vWGD1.json','r',encoding='utf-8'\\).read\\(\\); parsed=json.loads\\(data\\); text=parsed[0]['text']; print\\(text[:6000]\\)\")",
+      "Bash(powershell.exe -Command \"Stop-Process -Id 34948 -Force; Stop-Process -Id 31368 -Force; Start-Sleep -Seconds 1; Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue\")",
+      "Bash(ollama list:*)"
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "global": {
+    "lines": 80,
+    "branches": 70,
+    "functions": 80,
+    "statements": 80
+  },
+  "services": {
+    "frontend": { "lines": 75, "branches": 65, "functions": 75 },
+    "api": { "lines": 85, "branches": 75, "functions": 85 },
+    "agents": { "lines": 70, "branches": 60, "functions": 70 }
+  },
+  "flakiness": {
+    "quarantine_threshold": 70,
+    "warning_threshold": 40,
+    "max_flaky_tests": 5
+  }
+}
