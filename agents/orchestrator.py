@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, TypedDict
+from typing import Annotated, Awaitable, Callable, Optional, TypedDict
 from langgraph.graph import StateGraph, END
 
 from agents.analyzer import AnalyzerAgent, FileChange
@@ -16,7 +16,7 @@ from agents.integration_generator import IntegrationGeneratorAgent
 from agents.e2e_generator import E2EGeneratorAgent
 from agents.debugger import DebuggerAgent, DebugResult
 from agents.reporter import ReporterAgent
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, AgentClients
 from core.vector_store import CodeVectorStore
 from runners.jest_runner import JestRunner
 from runners.pytest_runner import PytestRunner
@@ -26,21 +26,64 @@ logger = logging.getLogger(__name__)
 EventCallback = Callable[[dict], Awaitable[None]]
 
 
+# ------------------------------------------------------------------
+# State reducers
+# ------------------------------------------------------------------
+
+def _error_reducer(current: Optional[str], new: Optional[str]) -> Optional[str]:
+    """Keep the first error that occurs — never overwrite with None from later nodes."""
+    if current:
+        return current
+    return new
+
+
+def _logs_reducer(current: Optional[list], new: Optional[list]) -> Optional[list]:
+    """Accumulate console logs across nodes instead of overwriting."""
+    if not current:
+        return new
+    if not new:
+        return current
+    return current + new
+
+
+def _generated_tests_reducer(current: Optional[dict], new: Optional[dict]) -> Optional[dict]:
+    """Merge generated test dicts so parallel/sequential nodes don't overwrite each other."""
+    if not current:
+        return new
+    if not new:
+        return current
+    merged = dict(current)
+    for key, val in new.items():
+        if key in merged and isinstance(merged[key], list) and isinstance(val, list):
+            merged[key] = merged[key] + val
+        else:
+            merged[key] = val
+    return merged
+
+
 class AgentState(TypedDict):
+    # --- Immutable trigger fields ---
     repo: str
     pr_number: int
     branch: str
     commit_sha: str
     changed_files: list[str]
+
+    # --- Pipeline fields (with reducers) ---
+    # error: first error wins — later nodes cannot overwrite an existing error
+    error: Annotated[Optional[str], _error_reducer]
+    # console_logs: accumulated across all run_tests calls
+    console_logs: Annotated[Optional[list], _logs_reducer]
+    # generated_tests: merged so unit/integration/e2e nodes compose rather than overwrite
+    generated_tests: Annotated[Optional[dict], _generated_tests_reducer]
+
+    # --- Pipeline fields (last-write-wins, safe because written by a single node) ---
     jira_ticket: Optional[dict]
     file_changes: Optional[list[FileChange]]
     workspace_dir: Optional[str]
-    generated_tests: Optional[dict]
     run_results: Optional[dict]
     debug_results: Optional[list]
     report: Optional[str]
-    error: Optional[str]
-    console_logs: Optional[list]
 
 
 def _notify_agent(name: str, status: str, task: str | None = None) -> None:
@@ -52,15 +95,15 @@ def _notify_agent(name: str, status: str, task: str | None = None) -> None:
 
 
 def _build_graph(
-    llm: LLMClient,
+    clients: AgentClients,
     store: CodeVectorStore,
     on_event: EventCallback,
 ) -> StateGraph:
     analyzer = AnalyzerAgent()
-    unit_gen = UnitGeneratorAgent(llm, store)
-    int_gen = IntegrationGeneratorAgent(llm, store)
-    e2e_gen = E2EGeneratorAgent(llm)
-    debugger = DebuggerAgent(llm)
+    unit_gen = UnitGeneratorAgent(clients.unit_generator, store)
+    int_gen = IntegrationGeneratorAgent(clients.integration_generator, store)
+    e2e_gen = E2EGeneratorAgent(clients.e2e_generator)
+    debugger = DebuggerAgent(clients.debugger)
     reporter = ReporterAgent()
     jest_runner = JestRunner()
     pytest_runner = PytestRunner()
@@ -544,9 +587,9 @@ async def run_pipeline(trigger: dict, on_event: Optional[EventCallback] = None) 
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
     try:
-        llm = LLMClient()
+        clients = AgentClients.build()
         store = CodeVectorStore()
-        compiled = _build_graph(llm, store, on_event).compile()
+        compiled = _build_graph(clients, store, on_event).compile()
 
         initial_state = AgentState(
             repo=trigger.get("repo") or os.environ.get("GITHUB_REPO", ""),
