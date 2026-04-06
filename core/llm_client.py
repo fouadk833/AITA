@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import AsyncGenerator, Literal
 
 logger = logging.getLogger(__name__)
@@ -10,14 +11,75 @@ logger = logging.getLogger(__name__)
 # Backend is selected via LLM_BACKEND env var: "openai", "anthropic", "gemini", or "ollama"
 Backend = Literal["openai", "anthropic", "gemini", "ollama"]
 
+# ------------------------------------------------------------------
+# Per-agent model configuration
+# Each agent gets a model tuned for its task:
+#   - unit_generator:         needs deep code reasoning  → large model
+#   - integration_generator:  needs API/HTTP awareness   → large model
+#   - e2e_generator:          needs UI/browser patterns  → large model
+#   - debugger:               needs root cause analysis  → large model
+#   - default:                fallback                   → large model
+#
+# Override any key via env var:  AITA_MODEL_<AGENT_KEY>
+# e.g. AITA_MODEL_DEBUGGER=claude-haiku-4-5
+# ------------------------------------------------------------------
+_AGENT_MODEL_DEFAULTS: dict[str, str] = {
+    "unit_generator":         "claude-sonnet-4-5",
+    "integration_generator":  "claude-sonnet-4-5",
+    "e2e_generator":          "claude-sonnet-4-5",
+    "debugger":               "claude-sonnet-4-5",
+    "default":                "claude-sonnet-4-5",
+}
+
+_AGENT_MAX_TOKENS: dict[str, int] = {
+    "unit_generator":         8096,
+    "integration_generator":  8096,
+    "e2e_generator":          4096,
+    "debugger":               2048,
+    "default":                8096,
+}
+
+
+def _resolve_model(agent_key: str) -> str:
+    """Return the model for a given agent key, with env-var override support."""
+    env_key = f"AITA_MODEL_{agent_key.upper()}"
+    return os.environ.get(env_key) or _AGENT_MODEL_DEFAULTS.get(agent_key) or _AGENT_MODEL_DEFAULTS["default"]
+
+
+def _resolve_max_tokens(agent_key: str) -> int:
+    return _AGENT_MAX_TOKENS.get(agent_key, _AGENT_MAX_TOKENS["default"])
+
+
+@dataclass
+class AgentClients:
+    """Holds one LLMClient per agent role."""
+    unit_generator: "LLMClient"
+    integration_generator: "LLMClient"
+    e2e_generator: "LLMClient"
+    debugger: "LLMClient"
+
+    @classmethod
+    def build(cls, backend: Backend | None = None) -> "AgentClients":
+        """Instantiate all per-agent clients. Logs the model assigned to each."""
+        agents = ["unit_generator", "integration_generator", "e2e_generator", "debugger"]
+        clients = {}
+        for agent in agents:
+            model = _resolve_model(agent)
+            max_tokens = _resolve_max_tokens(agent)
+            logger.info("AgentClients | %-25s → model=%-35s max_tokens=%d", agent, model, max_tokens)
+            clients[agent] = LLMClient(model=model, max_tokens=max_tokens, backend=backend)
+        return cls(**clients)
+
 
 class LLMClient:
     def __init__(
         self,
         model: str | None = None,
         backend: Backend | None = None,
+        max_tokens: int = 8096,
     ):
         self.backend: Backend = (backend or os.environ.get("LLM_BACKEND", "anthropic")).lower()  # type: ignore[assignment]
+        self.default_max_tokens = max_tokens
 
         if self.backend == "openai":
             self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -47,7 +109,7 @@ class LLMClient:
             self._async_client = None
         else:
             self.backend = "anthropic"
-            self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            self.model = model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
             import anthropic as _anthropic
             self._client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
             self._async_client = _anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -60,8 +122,10 @@ class LLMClient:
     # Public interface
     # ------------------------------------------------------------------
 
-    def generate(self, system_prompt: str, user_message: str, max_tokens: int = 8096) -> str:
-        logger.info("LLM generate — backend=%s model=%s prompt_chars=%d", self.backend, self.model, len(user_message))
+    def generate(self, system_prompt: str, user_message: str, max_tokens: int | None = None) -> str:
+        max_tokens = max_tokens or self.default_max_tokens
+        logger.info("LLM generate — backend=%s model=%s max_tokens=%d prompt_chars=%d",
+                    self.backend, self.model, max_tokens, len(user_message))
         t0 = time.monotonic()
         if self.backend == "openai":
             result = self._openai_generate(system_prompt, user_message, max_tokens)
@@ -74,8 +138,10 @@ class LLMClient:
         logger.info("LLM done — %.2fs response_chars=%d", time.monotonic() - t0, len(result))
         return result
 
-    async def generate_async(self, system_prompt: str, user_message: str, max_tokens: int = 8096) -> str:
-        logger.info("LLM generate_async — backend=%s model=%s prompt_chars=%d", self.backend, self.model, len(user_message))
+    async def generate_async(self, system_prompt: str, user_message: str, max_tokens: int | None = None) -> str:
+        max_tokens = max_tokens or self.default_max_tokens
+        logger.info("LLM generate_async — backend=%s model=%s max_tokens=%d prompt_chars=%d",
+                    self.backend, self.model, max_tokens, len(user_message))
         t0 = time.monotonic()
         if self.backend == "openai":
             result = await self._openai_generate_async(system_prompt, user_message, max_tokens)
@@ -92,7 +158,7 @@ class LLMClient:
         self,
         system_prompt: str,
         user_message: str,
-        max_tokens: int = 8096,
+        max_tokens: int | None = None,
     ) -> AsyncGenerator[str, None]:
         """Yield response tokens as they arrive."""
         if self.backend == "openai":
