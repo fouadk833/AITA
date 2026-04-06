@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.db.database import create_tables
-from api.routers import runs, coverage, flakiness, agents, branches, pulls, ws
+from api.routers import runs, coverage, flakiness, agents, branches, pulls, ws, webhooks
 
 load_dotenv()
 
@@ -72,7 +72,8 @@ app.include_router(flakiness.router, prefix="/api")
 app.include_router(agents.router, prefix="/api")
 app.include_router(branches.router, prefix="/api")
 app.include_router(pulls.router, prefix="/api")
-app.include_router(ws.router)   # WebSocket — no /api prefix (uses /ws/...)
+app.include_router(ws.router)        # WebSocket — no /api prefix (uses /ws/...)
+app.include_router(webhooks.router, prefix="/api")
 
 
 @app.get("/health")

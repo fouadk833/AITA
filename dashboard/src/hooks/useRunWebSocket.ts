@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 export type WSEvent =
   | { type: 'connected'; run_id: string }
   | { type: 'progress'; node: string; status: 'started' | 'done' | 'error'; message?: string }
-  | { type: 'llm_token'; agent: string; file?: string; token: string }
+  | { type: 'log'; level: 'info' | 'warning' | 'error'; logger: string; message: string }
   | { type: 'test_saved'; path: string; layer: 'unit' | 'integration' | 'e2e' }
   | { type: 'run_result'; passed: number; failed: number; skipped: number; duration: number }
   | { type: 'debug_result'; test_name: string; root_cause: string; fix_suggestion: string; confidence: number }

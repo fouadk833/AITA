@@ -25,8 +25,6 @@ interface ConsoleLog {
 
 interface CachedRunUIState {
   nodes:          Record<string, NodeStatus>
-  llmStreams:     Record<string, string>
-  activeAgent:    string | null
   savedTests:     string[]
   runResult:      RunResult | null
   debugEntries:   DebugEntry[]
@@ -233,8 +231,7 @@ export default function RunDetail() {
   const cached = runId ? _runUICache.get(runId) : undefined
 
   const [nodes,        setNodes]        = useState<Record<string, NodeStatus>>(cached?.nodes        ?? {})
-  const [llmStreams,   setLlmStreams]    = useState<Record<string, string>>   (cached?.llmStreams    ?? {})
-  const [activeAgent,  setActiveAgent]  = useState<string | null>            (cached?.activeAgent   ?? null)
+  const [liveLogs,     setLiveLogs]     = useState<Array<{level: string; logger: string; message: string}>>([])
   const [savedTests,   setSavedTests]   = useState<string[]>                 (cached?.savedTests    ?? [])
   const [runResult,    setRunResult]    = useState<RunResult | null>         (cached?.runResult     ?? null)
   const [debugEntries, setDebugEntries] = useState<DebugEntry[]>             (cached?.debugEntries  ?? [])
@@ -246,7 +243,7 @@ export default function RunDetail() {
   const seededRef        = useRef(cached != null)
   // Track how many events have already been applied so we never double-process
   const processedCountRef = useRef(cached?.eventsProcessed ?? 0)
-  const streamRef  = useRef<HTMLDivElement>(null)
+  const logsRef    = useRef<HTMLDivElement>(null)
   const queryClient = useQueryClient()
 
   // ── REST baseline ────────────────────────────────────────────────────
@@ -304,11 +301,10 @@ export default function RunDetail() {
             },
           }))
           break
-        case 'llm_token':
-          setActiveAgent(event.agent)
-          setLlmStreams((prev) => ({ ...prev, [event.agent]: (prev[event.agent] ?? '') + event.token }))
+        case 'log':
+          setLiveLogs((prev) => [...prev, { level: event.level, logger: event.logger, message: event.message }])
           requestAnimationFrame(() => {
-            if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
+            if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight
           })
           break
         case 'test_saved':
@@ -348,14 +344,13 @@ export default function RunDetail() {
   useEffect(() => {
     if (!runId) return
     _runUICache.set(runId, {
-      nodes, llmStreams, activeAgent, savedTests,
+      nodes, savedTests,
       runResult, debugEntries, consoleLogs, report, finalStatus,
       eventsProcessed: processedCountRef.current,
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, nodes, llmStreams, activeAgent, savedTests, runResult, debugEntries, consoleLogs, report, finalStatus])
+  }, [runId, nodes, savedTests, runResult, debugEntries, consoleLogs, report, finalStatus])
 
-  const currentStream = activeAgent ? (llmStreams[activeAgent] ?? '') : ''
   const displayStatus = finalStatus ?? restRun?.status ?? null
   const isFinished    = displayStatus ? FINAL_STATUSES.has(displayStatus) : false
 
@@ -371,7 +366,7 @@ export default function RunDetail() {
     // Clear caches and reset local UI state for the fresh run
     _runUICache.delete(runId)
     processedCountRef.current = 0
-    setNodes({}); setLlmStreams({}); setActiveAgent(null)
+    setNodes({}); setLiveLogs([])
     setSavedTests([]); setRunResult(null); setDebugEntries([]); setConsoleLogs([])
     setReport(''); setFinalStatus(null); seededRef.current = false
     try {
@@ -477,52 +472,47 @@ export default function RunDetail() {
           </ol>
         </div>
 
-        {/* LLM streaming output */}
+        {/* Live Logs */}
         <div className="bg-gray-800 rounded-xl p-5 border border-gray-700 flex flex-col min-h-[22rem]">
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              LLM Stream
-              {activeAgent && (
-                <span className="ml-2 text-indigo-400 font-normal normal-case">— {activeAgent}</span>
-              )}
+            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+              <Terminal size={13} className="text-indigo-400" />
+              Live Logs
             </h2>
-            {activeAgent && llmStreams[activeAgent] && (
-              <span className="text-xs text-gray-600">{llmStreams[activeAgent].length} chars</span>
-            )}
+            <span className="text-xs text-gray-600">{liveLogs.length} entries</span>
           </div>
           <div
-            ref={streamRef}
-            className="flex-1 overflow-y-auto rounded-lg bg-gray-950 p-3 font-mono text-xs text-green-300 whitespace-pre-wrap leading-relaxed"
+            ref={logsRef}
+            className="flex-1 overflow-y-auto rounded-lg bg-gray-950 p-3 space-y-0.5"
           >
-            {currentStream ? (
-              <>
-                {currentStream}
-                {!isFinished && (
-                  <span className="inline-block w-[2px] h-[1em] bg-green-400 ml-px align-middle animate-pulse" />
-                )}
-              </>
-            ) : (
-              <span className="text-gray-700 italic">
-                {isConnected ? 'Waiting for LLM output…' : isFinished ? 'Pipeline complete — no stream to show.' : 'Connecting to live stream…'}
+            {liveLogs.length === 0 ? (
+              <span className="text-gray-700 italic text-xs font-mono">
+                {isConnected ? 'Waiting for pipeline logs…' : isFinished ? 'Run complete.' : 'Connecting…'}
               </span>
+            ) : (
+              liveLogs.map((log, i) => (
+                <div key={i} className="flex gap-2 font-mono text-xs leading-5">
+                  <span className={clsx('flex-shrink-0 w-14 text-right', {
+                    'text-gray-500':  log.level === 'info',
+                    'text-yellow-400': log.level === 'warning',
+                    'text-red-400':   log.level === 'error',
+                  })}>
+                    {log.level}
+                  </span>
+                  <span className="text-gray-600 flex-shrink-0 truncate max-w-[100px]" title={log.logger}>
+                    {log.logger.split('.').pop()}
+                  </span>
+                  <span className={clsx('break-all', {
+                    'text-gray-300':  log.level === 'info',
+                    'text-yellow-300': log.level === 'warning',
+                    'text-red-300':   log.level === 'error',
+                  })}>
+                    {log.message}
+                  </span>
+                </div>
+              ))
             )}
           </div>
-          {Object.keys(llmStreams).length > 1 && (
-            <div className="flex gap-2 mt-3 flex-wrap">
-              {Object.keys(llmStreams).map((agent) => (
-                <button
-                  key={agent}
-                  onClick={() => setActiveAgent(agent)}
-                  className={clsx(
-                    'px-2 py-0.5 rounded text-xs font-medium transition-colors',
-                    activeAgent === agent ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600',
-                  )}
-                >
-                  {agent}
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       </div>
 

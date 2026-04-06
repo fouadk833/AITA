@@ -1,4 +1,6 @@
 anthropic==0.41.0
+google-generativeai>=0.8.0
+openai>=1.30.0
 jira==3.8.0
 ollama==0.4.4
 langgraph==0.2.60
@@ -8,6 +10,9 @@ langchain-community==0.3.13
 chromadb==0.6.3
 gitpython==3.1.44
 tree-sitter==0.23.2
+tree-sitter-python==0.23.6
+tree-sitter-typescript==0.23.2
+PyYAML==6.0.2
 PyGithub==2.5.0
 python-dotenv==1.0.1
 pydantic==2.10.3

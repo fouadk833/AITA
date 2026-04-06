@@ -41,6 +41,11 @@ class AgentState(TypedDict):
     report: Optional[str]
     error: Optional[str]
     console_logs: Optional[list]
+    # Production upgrade fields
+    risk_scores: Optional[dict]       # file_path → FileRisk
+    mutation_reports: Optional[dict]  # file_path → MutationReport
+    quality_scores: Optional[dict]    # test_file → TestQualityScore
+    heal_count: int                   # number of self-healing attempts so far
 
 
 def _notify_agent(name: str, status: str, task: str | None = None) -> None:
@@ -51,16 +56,37 @@ def _notify_agent(name: str, status: str, task: str | None = None) -> None:
         pass
 
 
+def _make_agent_llms() -> dict[str, LLMClient]:
+    """
+    Build per-agent LLMClient instances from env-var overrides.
+    Falls back to the default LLM_BACKEND when an override is not set.
+    """
+    def _agent_llm(backend_var: str, model_var: str) -> LLMClient:
+        backend = os.environ.get(backend_var, "").strip() or None
+        model = os.environ.get(model_var, "").strip() or None
+        return LLMClient(backend=backend, model=model)
+
+    return {
+        "generator": _agent_llm("AGENT_GENERATOR_BACKEND", "AGENT_GENERATOR_MODEL"),
+        "debugger":  _agent_llm("AGENT_DEBUGGER_BACKEND",  "AGENT_DEBUGGER_MODEL"),
+    }
+
+
 def _build_graph(
     llm: LLMClient,
     store: CodeVectorStore,
     on_event: EventCallback,
+    agent_llms: dict[str, LLMClient] | None = None,
 ) -> StateGraph:
+    agent_llms = agent_llms or {}
+    gen_llm  = agent_llms.get("generator", llm)
+    dbg_llm  = agent_llms.get("debugger",  llm)
+
     analyzer = AnalyzerAgent()
-    unit_gen = UnitGeneratorAgent(llm, store)
-    int_gen = IntegrationGeneratorAgent(llm, store)
-    e2e_gen = E2EGeneratorAgent(llm)
-    debugger = DebuggerAgent(llm)
+    unit_gen = UnitGeneratorAgent(gen_llm, store)
+    int_gen = IntegrationGeneratorAgent(gen_llm, store)
+    e2e_gen = E2EGeneratorAgent(gen_llm)
+    debugger = DebuggerAgent(dbg_llm)
     reporter = ReporterAgent()
     jest_runner = JestRunner()
     pytest_runner = PytestRunner()
@@ -72,7 +98,7 @@ def _build_graph(
             pass
 
     # ------------------------------------------------------------------
-    # Node definitions (all async so they can emit events and stream LLM)
+    # Node definitions
     # ------------------------------------------------------------------
 
     async def node_fetch_jira(state: AgentState) -> AgentState:
@@ -130,6 +156,32 @@ def _build_graph(
             _notify_agent("Analyzer", "error")
             await _emit({"type": "progress", "node": "analyze", "status": "error", "message": str(exc)})
             return {**state, "error": str(exc), "file_changes": []}
+
+    async def node_risk_score(state: AgentState) -> AgentState:
+        from agents.risk_scorer import RiskScorer
+        from core.config import AITAConfig
+        changes = state.get("file_changes") or []
+        eligible = [c for c in changes if c.change_type != "deleted"]
+        if not eligible:
+            logger.info("[risk_score] No eligible files — skipping")
+            await _emit({"type": "progress", "node": "risk_score", "status": "done", "message": "No files to score"})
+            return {**state, "risk_scores": {}}
+
+        workspace = state.get("workspace_dir") or "."
+        try:
+            config = AITAConfig.load(workspace)
+        except Exception:
+            config = AITAConfig()
+
+        logger.info("[risk_score] Scoring %d file(s)", len(eligible))
+        await _emit({"type": "progress", "node": "risk_score", "status": "started", "message": f"Scoring {len(eligible)} file(s)"})
+        scorer = RiskScorer()
+        risk_scores = scorer.score_changes(eligible, config)
+        for path, risk in risk_scores.items():
+            logger.info("[risk_score] %s → tier=%s composite=%.1f", path, risk.tier, risk.composite_risk)
+        await _emit({"type": "progress", "node": "risk_score", "status": "done",
+                     "message": f"{len(risk_scores)} file(s) scored"})
+        return {**state, "risk_scores": risk_scores}
 
     async def node_clone_repo(state: AgentState) -> AgentState:
         logger.info("[clone_repo] Starting — repo=%s branch=%s", state["repo"], state["branch"])
@@ -190,15 +242,63 @@ def _build_graph(
                 logger.info("[setup_workspace] Python deps installed")
             else:
                 logger.info("[setup_workspace] No Python dependency file found — skipping pip install")
+            _JEST_CONFIG_NAMES = (
+                "jest.config.js", "jest.config.ts", "jest.config.mjs",
+                "jest.config.cjs", "jest.config.cts", "jest.config.json",
+            )
             if (ws / "package.json").exists():
                 logger.info("[setup_workspace] Found package.json — running npm install")
                 await asyncio.to_thread(
                     subprocess.run, ["npm", "install", "--prefer-offline", "--silent"],
                     cwd=workspace, capture_output=True, text=True, timeout=300,
+                    shell=(sys.platform == "win32"),
                 )
                 logger.info("[setup_workspace] Node deps installed")
             else:
                 logger.info("[setup_workspace] No package.json found — skipping npm install")
+
+            # Ensure Jest + ts-jest are available for AITA-generated TypeScript tests.
+            # This is needed when the workspace is a Python/backend project with no frontend setup.
+            has_jest = (ws / "node_modules" / ".bin" / "jest").exists() or \
+                       (ws / "node_modules" / ".bin" / "jest.cmd").exists()
+            has_ts_jest = (ws / "node_modules" / "ts-jest").exists()
+
+            if not has_jest or not has_ts_jest:
+                logger.info("[setup_workspace] Installing jest + ts-jest for AITA test execution")
+                await _emit({"type": "progress", "node": "setup_workspace", "status": "started",
+                             "message": "Installing jest + ts-jest"})
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["npm", "install", "--save-dev",
+                     "jest", "ts-jest", "@types/jest", "typescript",
+                     "--prefer-offline", "--silent", "--no-audit"],
+                    cwd=workspace, capture_output=True, text=True, timeout=300,
+                    shell=(sys.platform == "win32"),
+                )
+                if result.returncode == 0:
+                    logger.info("[setup_workspace] jest + ts-jest installed")
+                else:
+                    logger.warning("[setup_workspace] jest install returned %d: %s",
+                                   result.returncode, result.stderr[:200])
+
+            # Write AITA jest config if no native jest config exists in workspace
+            has_jest_config = any((ws / name).exists() for name in _JEST_CONFIG_NAMES)
+            if not has_jest_config:
+                aita_cfg = ws / "jest.aita.config.js"
+                aita_cfg.write_text(
+                    "/** Auto-generated by AITA — safe to delete */\n"
+                    "module.exports = {\n"
+                    "  testEnvironment: 'node',\n"
+                    "  preset: 'ts-jest',\n"
+                    "  transform: { '^.+\\\\.(ts|tsx)$': ['ts-jest', { diagnostics: false }] },\n"
+                    "  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],\n"
+                    "  transformIgnorePatterns: [],\n"
+                    "  moduleDirectories: ['node_modules', '<rootDir>'],\n"
+                    "  globals: { 'ts-jest': { tsconfig: { strict: false, esModuleInterop: true } } },\n"
+                    "};\n",
+                    encoding="utf-8",
+                )
+                logger.info("[setup_workspace] Written AITA jest config: %s", aita_cfg)
         except Exception as exc:
             logger.warning("[setup_workspace] Dependency install error (non-fatal): %s", exc)
         await _emit({"type": "progress", "node": "setup_workspace", "status": "done", "message": "Dependencies ready"})
@@ -207,6 +307,7 @@ def _build_graph(
     async def node_generate_unit(state: AgentState) -> AgentState:
         changes = state.get("file_changes") or []
         eligible = [c for c in changes if c.change_type != "deleted"]
+        risk_scores = state.get("risk_scores") or {}
         logger.info("[generate_unit] Starting — %d/%d file(s) eligible (non-deleted)", len(eligible), len(changes))
         _notify_agent("UnitGenerator", "running", "Generating unit tests")
         await _emit({"type": "progress", "node": "generate_unit", "status": "started", "message": "Generating unit tests"})
@@ -216,18 +317,32 @@ def _build_graph(
         unit_tests: list[str] = []
         try:
             for change in eligible:
-                logger.info("[generate_unit] Generating unit tests for %s (lang=%s fns=%s)",
-                            change.path, change.language, change.functions_changed or "[]")
-                file_path = change.path
-
-                async def on_token(tok: str, fp: str = file_path) -> None:
-                    await _emit({"type": "llm_token", "agent": "UnitGenerator", "file": fp, "token": tok})
-
-                code = await unit_gen.generate_streaming(change, jira_ticket=jira_ticket, on_token=on_token)
+                risk = risk_scores.get(change.path)
+                risk_tier = risk.tier if risk else "medium"
+                logger.info("[generate_unit] Generating unit tests for %s (lang=%s tier=%s fns=%s)",
+                            change.path, change.language, risk_tier, change.functions_changed or "[]")
+                await _emit({"type": "progress", "node": "generate_unit", "status": "started",
+                             "message": f"[{risk_tier.upper()}] Generating: {Path(change.path).name}"})
+                code = await unit_gen.generate_streaming(change, jira_ticket=jira_ticket, risk_tier=risk_tier)
                 logger.info("[generate_unit] Generated %d chars of test code for %s", len(code), change.path)
+                if not code:
+                    logger.warning("[generate_unit] LLM returned empty response for %s — skipping", change.path)
+                    await _emit({"type": "progress", "node": "generate_unit", "status": "started",
+                                 "message": f"Skipped (empty LLM response): {Path(change.path).name}"})
+                    continue
                 path = unit_gen.save_test(code, change.path, output_dir=tests_dir)
                 unit_tests.append(path)
                 logger.info("[generate_unit] Saved → %s", path)
+                # Index in vector store for future runs
+                try:
+                    store.index_test_relationship(
+                        source_file=change.path,
+                        test_file=path,
+                        test_code=code,
+                        metadata={"risk_tier": risk_tier},
+                    )
+                except Exception:
+                    pass
                 await _emit({"type": "test_saved", "path": path, "layer": "unit"})
         except Exception as exc:
             logger.error("[generate_unit] Failed: %s", exc)
@@ -257,12 +372,9 @@ def _build_graph(
                     logger.info("[generate_integration] Skipping %s (is_api=%s change=%s)", change.path, is_api, change.change_type)
                     continue
                 logger.info("[generate_integration] Generating integration tests for %s", change.path)
-                file_path = change.path
-
-                async def on_token(tok: str, fp: str = file_path) -> None:
-                    await _emit({"type": "llm_token", "agent": "IntegrationGenerator", "file": fp, "token": tok})
-
-                code = await int_gen.generate_streaming(change, jira_ticket=jira_ticket, on_token=on_token)
+                await _emit({"type": "progress", "node": "generate_integration", "status": "started",
+                             "message": f"Generating: {Path(change.path).name}"})
+                code = await int_gen.generate_streaming(change, jira_ticket=jira_ticket)
                 logger.info("[generate_integration] Generated %d chars of test code for %s", len(code), change.path)
                 path = int_gen.save_test(code, change.path, output_dir=tests_dir)
                 int_tests.append(path)
@@ -296,12 +408,9 @@ def _build_graph(
                                 change.path, is_ts, is_component, change.change_type)
                     continue
                 logger.info("[generate_e2e] Generating E2E tests for %s", change.path)
-                file_path = change.path
-
-                async def on_token(tok: str, fp: str = file_path) -> None:
-                    await _emit({"type": "llm_token", "agent": "E2EGenerator", "file": fp, "token": tok})
-
-                code = await e2e_gen.generate_streaming(change, on_token=on_token)
+                await _emit({"type": "progress", "node": "generate_e2e", "status": "started",
+                             "message": f"Generating: {Path(change.path).name}"})
+                code = await e2e_gen.generate_streaming(change)
                 logger.info("[generate_e2e] Generated %d chars of test code for %s", len(code), change.path)
                 path = e2e_gen.save_test(code, change.path, output_dir=tests_dir)
                 e2e_tests.append(path)
@@ -330,7 +439,10 @@ def _build_graph(
         for i, test_path in enumerate(all_tests, 1):
             try:
                 runner_name = "pytest" if test_path.endswith(".py") else "jest"
+                file_label = Path(test_path).name
                 logger.info("[run_tests] [%d/%d] Running %s with %s", i, len(all_tests), test_path, runner_name)
+                await _emit({"type": "progress", "node": "run_tests", "status": "started",
+                             "message": f"[{i}/{len(all_tests)}] {file_label} ({runner_name})"})
                 if test_path.endswith(".py"):
                     result = await asyncio.to_thread(pytest_runner.run, test_path, cwd=workspace)
                 else:
@@ -394,6 +506,208 @@ def _build_graph(
         await _emit({"type": "progress", "node": "run_tests", "status": "done", "message": f"{total_passed} passed, {total_failed} failed"})
         return {**state, "run_results": run_results, "console_logs": console_logs}
 
+    async def node_heal(state: AgentState) -> AgentState:
+        """Self-healing: re-generate failing tests with error context (max 3 attempts)."""
+        run_results = state.get("run_results") or {}
+        failures = run_results.get("failures", [])
+        heal_count = state.get("heal_count", 0)
+        workspace = state.get("workspace_dir")
+        tests_dir = str(Path(workspace) / "__aita_tests__") if workspace else "tests"
+        jira_ticket = state.get("jira_ticket")
+        file_changes = {c.path: c for c in (state.get("file_changes") or [])}
+        risk_scores = state.get("risk_scores") or {}
+
+        logger.info("[heal] Attempt %d/3 — healing %d failure(s)", heal_count + 1, len(failures))
+        await _emit({"type": "progress", "node": "heal", "status": "started",
+                     "message": f"Self-healing attempt {heal_count + 1}/3"})
+
+        healed = 0
+        for failure in failures[:5]:  # cap at 5 per attempt to control runtime
+            test_path = failure.get("test_name", "")
+            error = failure.get("error", "") or failure.get("stack_trace", "")
+
+            # Get AI debug analysis for this failure
+            try:
+                dr = await debugger.analyze_failure_async(
+                    test_name=test_path,
+                    error=error,
+                    stack_trace=failure.get("stack_trace", ""),
+                    source=failure.get("source", ""),
+                )
+                heal_context = (
+                    f"Error: {error[:600]}\n"
+                    f"Root cause: {dr.root_cause}\n"
+                    f"Fix suggestion: {dr.fix_suggestion}"
+                )
+                # Store failure pattern for future runs
+                try:
+                    store.index_failure_pattern(
+                        test_name=test_path,
+                        error=error[:400],
+                        root_cause=dr.root_cause,
+                        fix_suggestion=dr.fix_suggestion,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning("[heal] Debugger failed for %s: %s", test_path, exc)
+                heal_context = f"Error: {error[:600]}"
+
+            # Find which source file this test was generated for
+            test_stem = Path(test_path).stem.replace(".test", "").replace("test_", "")
+            source_change = None
+            for src_path, change in file_changes.items():
+                if Path(src_path).stem == test_stem or test_stem in src_path:
+                    source_change = change
+                    break
+
+            if not source_change:
+                logger.warning("[heal] Cannot map test %s to source — skipping", test_path)
+                continue
+
+            risk = risk_scores.get(source_change.path)
+            risk_tier = risk.tier if risk else "medium"
+
+            logger.info("[heal] Regenerating %s with heal context", source_change.path)
+            await _emit({"type": "progress", "node": "heal", "status": "started",
+                         "message": f"Healing: {Path(source_change.path).name}"})
+            try:
+                code = await unit_gen.generate_streaming(
+                    source_change,
+                    jira_ticket=jira_ticket,
+                    risk_tier=risk_tier,
+                    heal_context=heal_context,
+                )
+                unit_gen.save_test(code, source_change.path, output_dir=tests_dir)
+                healed += 1
+                logger.info("[heal] Regenerated test for %s", source_change.path)
+            except Exception as exc:
+                logger.error("[heal] Regeneration failed for %s: %s", source_change.path, exc)
+
+        logger.info("[heal] Healed %d/%d test(s)", healed, min(len(failures), 5))
+        await _emit({"type": "progress", "node": "heal", "status": "done",
+                     "message": f"Regenerated {healed} test(s) — re-running"})
+        return {**state, "heal_count": heal_count + 1}
+
+    async def node_mutation_test(state: AgentState) -> AgentState:
+        from agents.mutation_agent import MutationAgent
+        from core.config import AITAConfig
+
+        file_changes = state.get("file_changes") or []
+        generated_tests = state.get("generated_tests") or {}
+        workspace = state.get("workspace_dir") or "."
+
+        py_changes = [c for c in file_changes if c.language == "python" and c.change_type != "deleted"]
+        if not py_changes:
+            logger.info("[mutation_test] No Python files to mutate — skipping")
+            await _emit({"type": "progress", "node": "mutation_test", "status": "done",
+                         "message": "Skipped (no Python files)"})
+            return {**state, "mutation_reports": {}}
+
+        try:
+            config = AITAConfig.load(workspace)
+        except Exception:
+            config = AITAConfig()
+
+        if not config.mutation.enabled:
+            logger.info("[mutation_test] Mutation testing disabled in config — skipping")
+            await _emit({"type": "progress", "node": "mutation_test", "status": "done",
+                         "message": "Disabled in config"})
+            return {**state, "mutation_reports": {}}
+
+        logger.info("[mutation_test] Starting on %d Python file(s)", len(py_changes))
+        await _emit({"type": "progress", "node": "mutation_test", "status": "started",
+                     "message": f"Mutating {len(py_changes)} Python file(s)"})
+
+        agent = MutationAgent()
+        try:
+            reports_list = await asyncio.to_thread(
+                agent.run,
+                py_changes[:3],       # cap at 3 files per run
+                generated_tests,
+                workspace,
+                config.mutation.threshold,
+                config.mutation.max_mutants_per_file,
+            )
+        except Exception as exc:
+            logger.warning("[mutation_test] Failed: %s", exc)
+            await _emit({"type": "progress", "node": "mutation_test", "status": "done",
+                         "message": f"Error: {exc}"})
+            return {**state, "mutation_reports": {}}
+
+        mutation_reports = {r.source_file: r for r in reports_list}
+        for src, r in mutation_reports.items():
+            logger.info("[mutation_test] %s → score=%.1f%% killed=%d survived=%d %s",
+                        src, r.mutation_score, r.killed, r.survived,
+                        "PASS" if r.passed_threshold else "FAIL")
+
+        await _emit({"type": "progress", "node": "mutation_test", "status": "done",
+                     "message": f"{len(mutation_reports)} file(s) mutation-tested"})
+        return {**state, "mutation_reports": mutation_reports}
+
+    async def node_score_quality(state: AgentState) -> AgentState:
+        from agents.quality_scorer import QualityScorer
+        from agents.flakiness_detector import FlakinessDetector
+
+        generated_tests = state.get("generated_tests") or {}
+        all_test_files = generated_tests.get("unit", []) + generated_tests.get("integration", [])
+        mutation_reports = state.get("mutation_reports") or {}
+        file_changes_map = {c.path: c for c in (state.get("file_changes") or [])}
+        workspace = state.get("workspace_dir") or "."
+
+        if not all_test_files:
+            logger.info("[score_quality] No test files to score — skipping")
+            await _emit({"type": "progress", "node": "score_quality", "status": "done",
+                         "message": "No tests to score"})
+            return {**state, "quality_scores": {}}
+
+        scorer = QualityScorer()
+        detector = FlakinessDetector()
+        quality_scores = {}
+
+        logger.info("[score_quality] Scoring %d test file(s)", len(all_test_files))
+        await _emit({"type": "progress", "node": "score_quality", "status": "started",
+                     "message": f"Scoring {len(all_test_files)} test file(s)"})
+
+        for test_file in all_test_files:
+            test_stem = Path(test_file).stem.replace(".test", "").replace("test_", "")
+            source_file = next(
+                (p for p in file_changes_map if Path(p).stem == test_stem or test_stem in p),
+                test_file,
+            )
+
+            lang = "python" if test_file.endswith(".py") else "typescript"
+            flakiness_score = 0.0
+            try:
+                code = Path(test_file).read_text(encoding="utf-8", errors="ignore")
+                flaky = detector.scan(code, lang)
+                flakiness_score = flaky["score"]
+                if flaky["risk_level"] != "low":
+                    logger.info("[score_quality] Flakiness %s=%s score=%.0f patterns=%s",
+                                Path(test_file).name, flaky["risk_level"],
+                                flakiness_score, flaky["patterns_found"])
+            except Exception:
+                pass
+
+            mutation_report = mutation_reports.get(source_file)
+            try:
+                score = scorer.score_file(
+                    test_file=test_file,
+                    source_file=source_file,
+                    workspace_dir=workspace,
+                    mutation_report=mutation_report,
+                    flakiness_score=flakiness_score,
+                )
+                quality_scores[test_file] = score
+                logger.info("[score_quality] %s → grade=%s composite=%.1f",
+                            Path(test_file).name, score.grade, score.composite_score)
+            except Exception as exc:
+                logger.warning("[score_quality] Scoring failed for %s: %s", test_file, exc)
+
+        await _emit({"type": "progress", "node": "score_quality", "status": "done",
+                     "message": f"{len(quality_scores)} test(s) scored"})
+        return {**state, "quality_scores": quality_scores}
+
     async def node_debug(state: AgentState) -> AgentState:
         run_results = state.get("run_results") or {}
         failures = run_results.get("failures", [])
@@ -438,8 +752,13 @@ def _build_graph(
     async def node_report(state: AgentState) -> AgentState:
         run_results = state.get("run_results") or {}
         debug_results_raw = state.get("debug_results") or []
-        logger.info("[reporter] Building report — passed=%d failed=%d debug_entries=%d",
-                    run_results.get("passed", 0), run_results.get("failed", 0), len(debug_results_raw))
+        quality_scores = state.get("quality_scores")
+        mutation_reports = state.get("mutation_reports")
+        logger.info("[reporter] Building report — passed=%d failed=%d debug=%d quality=%d mutation=%d",
+                    run_results.get("passed", 0), run_results.get("failed", 0),
+                    len(debug_results_raw),
+                    len(quality_scores) if quality_scores else 0,
+                    len(mutation_reports) if mutation_reports else 0)
         await _emit({"type": "progress", "node": "reporter", "status": "started", "message": "Building report"})
         debug_results = [
             DebugResult(
@@ -451,7 +770,11 @@ def _build_graph(
             )
             for d in debug_results_raw
         ]
-        report = reporter.build_pr_comment(run_results, debug_results)
+        report = reporter.build_pr_comment(
+            run_results, debug_results,
+            quality_scores=quality_scores,
+            mutation_reports=mutation_reports,
+        )
         logger.info("[reporter] Report built (%d chars)", len(report))
         await _emit({"type": "progress", "node": "reporter", "status": "done"})
         return {**state, "report": report}
@@ -469,43 +792,88 @@ def _build_graph(
         return {**state, "workspace_dir": None}
 
     # ------------------------------------------------------------------
+    # Routing functions
+    # ------------------------------------------------------------------
+
+    def _heal_or_proceed(s: AgentState) -> str:
+        failures = (s.get("run_results") or {}).get("failed", 0)
+        heal_count = s.get("heal_count", 0)
+        if failures > 0 and heal_count < 3:
+            return "heal"
+        return "proceed"
+
+    def _debug_or_report(s: AgentState) -> str:
+        return "debug" if (s.get("run_results") or {}).get("failed", 0) > 0 else "reporter"
+
+    def _continue_or_abort(s: AgentState) -> str:
+        """Route to cleanup immediately when a fatal error has been recorded."""
+        return "abort" if s.get("error") else "continue"
+
+    # ------------------------------------------------------------------
     # Build the graph
     # ------------------------------------------------------------------
     graph = StateGraph(AgentState)
 
     for name, fn in [
-        ("fetch_jira", node_fetch_jira),
-        ("analyze", node_analyze),
-        ("clone_repo", node_clone_repo),
-        ("setup_workspace", node_setup_workspace),
-        ("generate_unit", node_generate_unit),
-        ("generate_integration", node_generate_integration),
-        ("generate_e2e", node_generate_e2e),
-        ("run_tests", node_run_tests),
-        ("debug", node_debug),
-        ("reporter", node_report),
-        ("cleanup", node_cleanup),
+        ("fetch_jira",            node_fetch_jira),
+        ("analyze",               node_analyze),
+        ("risk_score",            node_risk_score),
+        ("clone_repo",            node_clone_repo),
+        ("setup_workspace",       node_setup_workspace),
+        ("generate_unit",         node_generate_unit),
+        ("generate_integration",  node_generate_integration),
+        ("generate_e2e",          node_generate_e2e),
+        ("run_tests",             node_run_tests),
+        ("node_heal",             node_heal),
+        ("mutation_test",         node_mutation_test),
+        ("score_quality",         node_score_quality),
+        ("debug",                 node_debug),
+        ("reporter",              node_report),
+        ("cleanup",               node_cleanup),
     ]:
         graph.add_node(name, fn)
 
     graph.set_entry_point("fetch_jira")
-    graph.add_edge("fetch_jira", "analyze")
-    graph.add_edge("analyze", "clone_repo")
-    graph.add_edge("clone_repo", "setup_workspace")
-    graph.add_edge("setup_workspace", "generate_unit")
-    graph.add_edge("generate_unit", "generate_integration")
+    graph.add_edge("fetch_jira",           "analyze")
+    graph.add_edge("analyze",              "risk_score")
+    graph.add_edge("risk_score",           "clone_repo")
+    graph.add_edge("clone_repo",           "setup_workspace")
+    graph.add_edge("setup_workspace",      "generate_unit")
+    # If unit generation fails (e.g. LLM connection error), skip straight to reporter
+    graph.add_conditional_edges(
+        "generate_unit",
+        _continue_or_abort,
+        {"continue": "generate_integration", "abort": "reporter"},
+    )
     graph.add_edge("generate_integration", "generate_e2e")
-    graph.add_edge("generate_e2e", "run_tests")
+    graph.add_edge("generate_e2e",         "run_tests")
+
+    # Self-healing loop: run_tests → heal → run_tests (max 3×), then proceed
     graph.add_conditional_edges(
         "run_tests",
-        lambda s: "debug" if (s.get("run_results") or {}).get("failed", 0) > 0 else "reporter",
+        _heal_or_proceed,
+        {"heal": "node_heal", "proceed": "mutation_test"},
+    )
+    graph.add_edge("node_heal", "run_tests")  # healing cycle
+
+    graph.add_edge("mutation_test",  "score_quality")
+    graph.add_conditional_edges(
+        "score_quality",
+        _debug_or_report,
         {"debug": "debug", "reporter": "reporter"},
     )
-    graph.add_edge("debug", "reporter")
+    graph.add_edge("debug",    "reporter")
     graph.add_edge("reporter", "cleanup")
-    graph.add_edge("cleanup", END)
+    graph.add_edge("cleanup",  END)
 
     return graph
+
+
+_NOISY_LOGGERS = frozenset({
+    "uvicorn", "uvicorn.error", "uvicorn.access",
+    "fastapi", "httpx", "httpcore",
+    "api.ws_manager", "api.routers.ws",
+})
 
 
 class _LiveLogHandler(logging.Handler):
@@ -515,9 +883,15 @@ class _LiveLogHandler(logging.Handler):
         super().__init__()
         self._callback = callback
         self._loop = loop
+        self._emitting = False  # re-entrancy guard
 
     def emit(self, record: logging.LogRecord) -> None:
+        if self._emitting:
+            return
+        if record.name in _NOISY_LOGGERS or record.name.startswith("uvicorn"):
+            return
         try:
+            self._emitting = True
             msg = self.format(record)
             event = {
                 "type": "log",
@@ -529,6 +903,8 @@ class _LiveLogHandler(logging.Handler):
                 self._loop.create_task(self._callback(event))
         except Exception:
             pass
+        finally:
+            self._emitting = False
 
 
 async def run_pipeline(trigger: dict, on_event: Optional[EventCallback] = None) -> AgentState:
@@ -546,7 +922,7 @@ async def run_pipeline(trigger: dict, on_event: Optional[EventCallback] = None) 
     try:
         llm = LLMClient()
         store = CodeVectorStore()
-        compiled = _build_graph(llm, store, on_event).compile()
+        compiled = _build_graph(llm, store, on_event, _make_agent_llms()).compile()
 
         initial_state = AgentState(
             repo=trigger.get("repo") or os.environ.get("GITHUB_REPO", ""),
@@ -563,6 +939,10 @@ async def run_pipeline(trigger: dict, on_event: Optional[EventCallback] = None) 
             report=None,
             error=None,
             console_logs=None,
+            risk_scores=None,
+            mutation_reports=None,
+            quality_scores=None,
+            heal_count=0,
         )
         return await compiled.ainvoke(initial_state)
     finally:

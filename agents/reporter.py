@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
+from pathlib import Path
 from agents.debugger import DebugResult
 
 
@@ -9,6 +10,8 @@ class ReporterAgent:
         run_results: dict,
         debug_results: list[DebugResult],
         coverage: dict | None = None,
+        quality_scores: dict | None = None,
+        mutation_reports: dict | None = None,
     ) -> str:
         passed = run_results.get("passed", 0)
         failed = run_results.get("failed", 0)
@@ -43,6 +46,38 @@ class ReporterAgent:
             for svc, cov in coverage.items():
                 lines.append(
                     f"| {svc} | {cov.get('lines', 0):.1f}% | {cov.get('branches', 0):.1f}% | {cov.get('functions', 0):.1f}% |"
+                )
+
+        if quality_scores:
+            lines += [
+                "",
+                "### Test Quality Scores",
+                "",
+                "| Test File | Grade | Score | Assertions | Coverage | Mutation |",
+                "|-----------|-------|-------|------------|----------|---------|",
+            ]
+            for test_file, qs in quality_scores.items():
+                name = Path(test_file).name
+                lines.append(
+                    f"| `{name}` | **{qs.grade}** | {qs.composite_score:.0f} "
+                    f"| {qs.assertion_score:.0f} | {qs.branch_coverage:.0f}% "
+                    f"| {qs.mutation_kill_rate:.0f}% |"
+                )
+
+        if mutation_reports:
+            lines += [
+                "",
+                "### Mutation Testing",
+                "",
+                "| Source File | Score | Killed | Survived | Status |",
+                "|------------|-------|--------|----------|--------|",
+            ]
+            for src_file, mr in mutation_reports.items():
+                name = Path(src_file).name
+                status = "✅ PASS" if mr.passed_threshold else "❌ FAIL"
+                lines.append(
+                    f"| `{name}` | {mr.mutation_score:.1f}% "
+                    f"| {mr.killed} | {mr.survived} | {status} |"
                 )
 
         if debug_results:

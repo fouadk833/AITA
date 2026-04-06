@@ -6,6 +6,22 @@ from core.llm_client import LLMClient
 from core.prompts.debugger_prompt import SYSTEM_PROMPT, build_debugger_prompt
 
 
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences from LLM response, safely."""
+    cleaned = text.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+    parts = cleaned.split("```")
+    # parts[0] == "" (before opening fence), parts[1] == content, parts[2] == "" (after closing)
+    if len(parts) < 2:
+        return cleaned
+    inner = parts[1]
+    # Strip language identifier (e.g. "json\n...")
+    if "\n" in inner:
+        inner = inner[inner.index("\n") + 1:]
+    return inner.strip()
+
+
 @dataclass
 class DebugResult:
     test_name: str
@@ -37,21 +53,16 @@ class DebuggerAgent:
         response = self.llm.generate(SYSTEM_PROMPT, prompt, max_tokens=2048)
 
         try:
-            # Strip markdown fences if present
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
+            cleaned = _strip_fences(response)
             data = json.loads(cleaned)
             return DebugResult(
                 test_name=test_name,
-                root_cause=data.get("root_cause", "Unknown"),
-                fix_suggestion=data.get("fix_suggestion", ""),
+                root_cause=str(data.get("root_cause") or "Unknown"),
+                fix_suggestion=str(data.get("fix_suggestion") or ""),
                 fix_code=data.get("fix_code"),
-                confidence=int(data.get("confidence", 50)),
+                confidence=int(data.get("confidence") or 50),
             )
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, IndexError):
             return DebugResult(
                 test_name=test_name,
                 root_cause=response[:500],
@@ -78,20 +89,16 @@ class DebuggerAgent:
         )
         response = await self.llm.generate_async(SYSTEM_PROMPT, prompt, max_tokens=2048)
         try:
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
+            cleaned = _strip_fences(response)
             data = json.loads(cleaned)
             return DebugResult(
                 test_name=test_name,
-                root_cause=data.get("root_cause", "Unknown"),
-                fix_suggestion=data.get("fix_suggestion", ""),
+                root_cause=str(data.get("root_cause") or "Unknown"),
+                fix_suggestion=str(data.get("fix_suggestion") or ""),
                 fix_code=data.get("fix_code"),
-                confidence=int(data.get("confidence", 50)),
+                confidence=int(data.get("confidence") or 50),
             )
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, IndexError):
             return DebugResult(
                 test_name=test_name,
                 root_cause=response[:500],
