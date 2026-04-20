@@ -6,23 +6,26 @@ from runners.base_runner import BaseRunner, RunResult
 
 
 class PytestRunner(BaseRunner):
-    def run(self, test_path: str, cwd: str = ".", **kwargs) -> RunResult:
+    def run(self, test_path: str, cwd: str = ".", line_callback=None, **kwargs) -> RunResult:
         report_file = os.path.join(tempfile.gettempdir(), "pytest_report.json")
         cmd = [
             sys.executable, "-m", "pytest", test_path,
             "--json-report",
             f"--json-report-file={report_file}",
-            "-q", "--tb=short",
+            "-v", "--tb=short",   # verbose: one PASSED/FAILED line per test
             f"--rootdir={cwd}",
             "--import-mode=importlib",
         ]
-        # Inject workspace-local deps (.ws_deps) into PYTHONPATH so tests can
-        # import repo code without touching the server's own virtual environment.
+        # Inject workspace root and .ws_deps into PYTHONPATH so generated tests
+        # can import source code as well as third-party deps installed by setup_workspace.
         env = os.environ.copy()
         ws_deps = os.path.join(cwd, ".ws_deps")
+        extra_paths = [cwd]  # workspace root first — makes "from src.x import y" work
         if os.path.isdir(ws_deps):
-            env["PYTHONPATH"] = ws_deps + os.pathsep + env.get("PYTHONPATH", "")
-        stdout, stderr, exit_code = self._exec(cmd, cwd=cwd, env=env)
+            extra_paths.append(ws_deps)
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(extra_paths) + (os.pathsep + existing if existing else "")
+        stdout, stderr, exit_code = self._exec(cmd, cwd=cwd, env=env, line_callback=line_callback)
 
         try:
             with open(report_file) as f:

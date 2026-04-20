@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import re
@@ -91,11 +92,11 @@ class LLMClient:
             self._base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
             self._client = None
             self._async_client = None
-            # Inference options — tuned for lightweight models
+            # Inference options — sized for code generation prompts
             self._ollama_options = {
                 "temperature":    float(os.environ.get("OLLAMA_TEMPERATURE",    "0.1")),
-                "num_ctx":        int(os.environ.get("OLLAMA_NUM_CTX",          "4096")),
-                "num_predict":    int(os.environ.get("OLLAMA_NUM_PREDICT",      "2048")),
+                "num_ctx":        int(os.environ.get("OLLAMA_NUM_CTX",          "32768")),
+                "num_predict":    int(os.environ.get("OLLAMA_NUM_PREDICT",      "4096")),
                 "top_p":          float(os.environ.get("OLLAMA_TOP_P",          "0.9")),
                 "top_k":          int(os.environ.get("OLLAMA_TOP_K",            "40")),
                 "repeat_penalty": float(os.environ.get("OLLAMA_REPEAT_PENALTY", "1.1")),
@@ -211,19 +212,31 @@ class LLMClient:
         if language:
             m = re.search(rf"```(?:{re.escape(language)})\s*\n(.*?)```", response, re.DOTALL)
             if m:
-                return m.group(1).strip()
+                return self._sanitize_extracted(m.group(1).strip(), language)
         # 2. Any fenced block
         m = re.search(r"```(?:\w+)?\s*\n(.*?)```", response, re.DOTALL)
         if m:
-            return m.group(1).strip()
+            return self._sanitize_extracted(m.group(1).strip(), language)
         # 3. Incomplete closing fence (LLM cut off) — grab everything after opening fence
         m = re.search(r"```(?:\w+)?\s*\n(.*?)$", response, re.DOTALL)
         if m:
-            return m.group(1).strip()
+            return self._sanitize_extracted(m.group(1).strip(), language)
         # 4. Strip all fence lines manually from the raw response
         lines = response.strip().splitlines()
         cleaned = "\n".join(line for line in lines if not re.match(r"^\s*```", line))
-        return cleaned.strip()
+        return self._sanitize_extracted(cleaned.strip(), language)
+
+    @staticmethod
+    def _sanitize_extracted(code: str, language: str) -> str:
+        """Fix common LLM mistakes that produce runtime errors."""
+        if language == "python":
+            # LLMs (especially small ones) sometimes emit JS-style boolean/null
+            # literals in Python code.  These are valid syntax but crash at
+            # runtime with `NameError: name 'false' is not defined`.
+            code = re.sub(r'\bfalse\b', 'False', code)
+            code = re.sub(r'\btrue\b',  'True',  code)
+            code = re.sub(r'\bnull\b',  'None',  code)
+        return code
 
     # ------------------------------------------------------------------
     # Anthropic backend
@@ -357,15 +370,24 @@ class LLMClient:
 
     def _ollama_generate(self, system_prompt: str, user_message: str) -> str:
         import ollama
-        response = ollama.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            options=self._ollama_options,
-        )
-        return response["message"]["content"]
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                options=self._ollama_options,
+            )
+            return response["message"]["content"]
+        except Exception as exc:
+            msg = str(exc)
+            if "10061" in msg or "Connection refused" in msg or "actively refused" in msg.lower():
+                raise ConnectionRefusedError(
+                    f"Ollama is not running. Start it with: ollama serve "
+                    f"(expected at {self._base_url})"
+                ) from exc
+            raise
 
     async def _ollama_generate_async(self, system_prompt: str, user_message: str) -> str:
         import asyncio
@@ -394,7 +416,14 @@ class LLMClient:
                     if token:
                         loop.call_soon_threadsafe(queue.put_nowait, token)
             except Exception as exc:
-                errors.append(exc)
+                msg = str(exc)
+                if "10061" in msg or "Connection refused" in msg or "actively refused" in msg.lower():
+                    errors.append(ConnectionRefusedError(
+                        f"Ollama is not running. Start it with: ollama serve "
+                        f"(expected at {self._base_url})"
+                    ))
+                else:
+                    errors.append(exc)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 

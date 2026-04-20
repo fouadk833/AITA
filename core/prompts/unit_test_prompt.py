@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -40,26 +41,37 @@ JEST / TYPESCRIPT rules:
    ✗ WRONG:  import { fn } from './fn'
    ✓ CORRECT: import { fn } from '../../../src/utils/fn'
 
-3. Use `toEqual` (deep equality) for objects and arrays — NOT `toBe`.
+3. NEVER mock the module you are testing. Only mock its EXTERNAL DEPENDENCIES (e.g. axios, databases, other services).
+   ✗ WRONG:  import { calculateScore } from '../../../src/utils/score';
+             jest.mock('../../../src/utils/score');   // ← NEVER do this — you just mocked the thing you're testing!
+   ✓ CORRECT: import { calculateScore } from '../../../src/utils/score';
+              jest.mock('axios');                     // ← mock dependencies of calculateScore, not calculateScore itself
+
+4. Use `jest.clearAllMocks()` ALWAYS — NEVER just `clearAllMocks()` alone (it does not exist globally and throws ReferenceError):
+   ✗ WRONG:  beforeEach(() => { clearAllMocks(); });
+   ✓ CORRECT: beforeEach(() => { jest.clearAllMocks(); });
+
+5. Use `toEqual` (deep equality) for objects and arrays — NOT `toBe`.
    `toBe` uses reference equality (===) and fails for objects.
    ✓ expect(result).toEqual({ score: 42, label: 'good' })
 
-4. `jest.mock(...)` must be called at the TOP LEVEL (module scope), BEFORE describe blocks.
+6. `jest.mock(...)` must be called at the TOP LEVEL (module scope), BEFORE describe blocks.
    ✓ jest.mock('axios');
    ✓ const mockFn = jest.fn();
 
-5. Clear mocks in `beforeEach`:
-   beforeEach(() => { jest.clearAllMocks(); });
+7. TypeScript types/interfaces: ONLY use types that you explicitly import. Do NOT reference types from the module under test unless you add a named import for them.
+   ✗ WRONG:  const x: MyType = { ... }   // if MyType was never imported
+   ✓ CORRECT: import { calculateScore, type MyType } from '../../../src/utils/score';
 
-6. Async tests: use `async/await` inside `it()` callbacks.
+8. Async tests: use `async/await` inside `it()` callbacks.
    ✓ it('fetches data', async () => { const result = await fn(); ... });
 
-7. Testing thrown errors:
+9. Testing thrown errors:
    ✓ expect(() => fn(bad)).toThrow('Expected message');
    ✓ await expect(asyncFn(bad)).rejects.toThrow('Expected message');
 
-8. Snapshots: use `toMatchSnapshot()` ONLY when a function returns a complex object
-   with many fields — not for simple primitives or booleans.
+10. Snapshots: use `toMatchSnapshot()` ONLY when a function returns a complex object
+    with many fields — not for simple primitives or booleans.
 
 PYTEST / PYTHON rules:
 1. One import per symbol — never duplicate imports.
@@ -72,6 +84,11 @@ UNIVERSAL rules:
 - Every test must be independently runnable — no shared mutable state.
 - Arrange / Act / Assert pattern — three logical sections per test.
 - Never test implementation details — test observable behaviour.
+- ALWAYS compute expected values from the actual source code constants/formulas — never guess or approximate.
+  If the source has weights, thresholds, or formulas, manually evaluate them for your test inputs.
+- ONLY test edge cases (null, undefined, out-of-range) when the source code EXPLICITLY handles them
+  with a guard (e.g. `if (x == null)`, `try/catch`, `?? default`). If there is no guard in the source,
+  do NOT write a test for that edge case — the function will crash and the test will fail.
 """
 
 # ---------------------------------------------------------------------------
@@ -106,15 +123,18 @@ REFERENCE EXAMPLE — correct Jest/TypeScript test structure
 ```typescript
 // ── imports ──────────────────────────────────────────
 import { calculateScore } from '../../../src/utils/score';
+import axios from 'axios';  // only imported if calculateScore uses it
 
-// ── module-level mocks (before describe) ─────────────
-jest.mock('../../../src/api/client');
-const mockFetch = jest.fn();
+// ── mock DEPENDENCIES (NOT the module under test) ────
+// ✓ We mock axios because calculateScore calls it internally.
+// ✗ We do NOT mock '../../../src/utils/score' — that is the code we are testing.
+jest.mock('axios');
+const mockedAxios = axios as jest.Mocked<typeof axios>;
 
 // ── test suite ───────────────────────────────────────
 describe('calculateScore', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.clearAllMocks();  // always jest.clearAllMocks(), never clearAllMocks()
   });
 
   it('returns correct score for valid inputs', () => {
@@ -124,11 +144,6 @@ describe('calculateScore', () => {
     const result = calculateScore(input);
     // Assert
     expect(result).toEqual({ score: 20, grade: 'B' });
-  });
-
-  it('matches snapshot for complex output', () => {
-    const result = calculateScore({ value: 100, weight: 1 });
-    expect(result).toMatchSnapshot();
   });
 
   it('throws RangeError when value is negative', () => {
@@ -186,15 +201,20 @@ You are an expert QA engineer. Generate valid, runnable unit tests only.
 STRICT RULES for Jest/TypeScript:
 - describe/it/expect/jest are GLOBAL — NEVER import them from any package
 - Use the EXACT import path given — no other path
+- NEVER mock the file you are testing. Only mock its dependencies (e.g. axios, database)
+- ALWAYS write jest.clearAllMocks() — NEVER just clearAllMocks() (throws ReferenceError)
 - toEqual for objects, toBe for primitives
 - jest.mock() at module top level before describe
-- clearAllMocks() in beforeEach
-- async it() for async functions
+- Only use TypeScript types you explicitly import
+- COMPUTE expected values from the source constants/formulas — never guess them
+- ONLY test null/undefined/edge inputs when the source explicitly guards against them
 
 STRICT RULES for pytest:
 - pytest.raises for exceptions
 - One assert per logical check
 - Fixture for shared setup
+- Compute expected values from source code, never guess
+- Only test None/empty inputs when the source has an explicit guard for them
 
 Output ONLY the code block. No prose.
 """
@@ -364,6 +384,8 @@ def _build_import_hint(file_path: str, language: str, rel_import: str) -> str:
     return (
         f"EXACT import to use (copy verbatim): `import {{ ... }} from '{rel_import}';`\n"
         f"⚠ DO NOT use any other path. DO NOT import jest globals (describe/it/expect).\n"
+        f"⚠ DO NOT call jest.mock('{rel_import}') — that is the file you are testing, not a dependency.\n"
+        f"   Only use jest.mock() for its external dependencies (e.g. axios, database clients).\n"
     )
 
 
@@ -384,10 +406,14 @@ def _build_ast_context(
         lines.append(f"Exported classes to test: {', '.join(f'`{c}`' for c in classes)}")
 
     if imports:
-        # Surface only external/non-relative imports — these are candidates for mocking
-        external = [imp for imp in imports if "from '" not in imp or not imp.split("from '")[1].startswith(".")]
+        # Surface only genuinely external imports — exclude relative imports (start with . or ..)
+        # and the source file itself. These are candidates for mocking.
+        external = [
+            imp for imp in imports
+            if not re.search(r"""from\s+['"]\.""", imp)  # not relative
+        ]
         if external:
-            lines.append("External dependencies (mock these in tests):")
+            lines.append("External dependencies (mock ONLY these — not the module under test):")
             for imp in external[:8]:
                 lines.append(f"  • {imp.strip()}")
 
@@ -522,9 +548,17 @@ File: `{inputs.file_path}`
 ━━━ Requirements ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Test every exported function / class listed above
 2. One test per logical branch (if/else, try/catch, ternary)
-3. Edge cases: null, undefined, empty string, 0, empty array, very large values
+3. Edge cases: ONLY test inputs that the source code explicitly handles (e.g. null checks, try/catch, default values).
+   Do NOT pass null, undefined, or invalid inputs unless the source has an explicit guard — the function will crash.
 4. Mock every external import listed in the analysis above
 5. Group tests in `describe` blocks (Jest) or classes (pytest)
+6. ⚠️ CRITICAL — COMPUTE expected values from the SOURCE CODE above, do NOT guess:
+   - Read every constant, weight, threshold, and formula in the source
+   - Manually calculate the exact output for each test input using those values
+   - Write the computed result as the expected value in the assertion
+   - Example: if source has `score = Math.round((a*0.35 + b*0.45 + c*0.20)*100)`,
+     then for a=0.5, b=0.6, c=0.7 compute: round((0.5*0.35+0.6*0.45+0.7*0.20)*100) = round(57.5) = 58
+     and write: expect(result.score).toBe(58)
 {ac_requirement}
 ━━━ Output format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Return ONLY a single ```{inputs.ext} code block. No markdown, no explanation outside it.

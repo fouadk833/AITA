@@ -1,9 +1,13 @@
 from __future__ import annotations
+import logging
+import re
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from core.llm_client import LLMClient
 from core.prompts.e2e_test_prompt import SYSTEM_PROMPT, build_e2e_test_prompt
 from agents.analyzer import FileChange
+
+logger = logging.getLogger(__name__)
 
 
 class E2EGeneratorAgent:
@@ -60,5 +64,11 @@ class E2EGeneratorAgent:
         p = Path(source_path)
         out_path = Path(output_dir) / "frontend" / "e2e" / f"{p.stem}.spec.ts"
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Strip bad jest/vitest global imports that LLMs sometimes generate
+        test_code = re.sub(
+            r"import\s*\{[^}]*\}\s*from\s*['\"](?:jest|vitest)['\"];?\n?",
+            "",
+            test_code,
+        )
         out_path.write_text(test_code, encoding="utf-8")
         return str(out_path)

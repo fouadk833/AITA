@@ -1,4 +1,7 @@
 from __future__ import annotations
+import ast
+import logging
+import re
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from core.llm_client import LLMClient
@@ -9,6 +12,8 @@ from core.prompts.integration_test_prompt import (
     build_openapi_test_prompt,
 )
 from agents.analyzer import FileChange
+
+logger = logging.getLogger(__name__)
 
 _NESTJS_PATTERNS = ("controller", "resolver", "gateway", "module")
 _FASTAPI_PATTERNS = ("router", "route", "endpoint", "api")
@@ -71,5 +76,41 @@ class IntegrationGeneratorAgent:
         ext = ".test.ts" if sub == "nestjs" else "_test.py"
         out_path = Path(output_dir) / "backend" / sub / f"{stem}{ext}"
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if ext == "_test.py":
+            test_code = self._validate_python(test_code, source_path)
+        else:
+            test_code = self._validate_typescript(test_code, source_path)
+
         out_path.write_text(test_code, encoding="utf-8")
         return str(out_path)
+
+    # ------------------------------------------------------------------
+    # Syntax validators
+    # ------------------------------------------------------------------
+
+    def _validate_python(self, code: str, source_path: str) -> str:
+        try:
+            ast.parse(code)
+            return code
+        except SyntaxError as e:
+            logger.warning("Syntax error in generated integration test for %s: %s", source_path, e)
+            error_short = str(e).replace("'", "\\'")
+            return (
+                f"# AITA: generated test contained a syntax error and was skipped.\n"
+                f"# Source: {source_path}\n"
+                f"# Error:  {e}\n"
+                f"import pytest\n\n"
+                f"@pytest.mark.skip(reason='Generated test had a syntax error: {error_short}')\n"
+                f"def test_skipped_due_to_generation_error():\n"
+                f"    pass\n"
+            )
+
+    def _validate_typescript(self, code: str, source_path: str) -> str:
+        # Strip bad jest/vitest imports
+        code = re.sub(
+            r"import\s*\{[^}]*\}\s*from\s*['\"](?:jest|vitest)['\"];?\n?",
+            "",
+            code,
+        )
+        return code

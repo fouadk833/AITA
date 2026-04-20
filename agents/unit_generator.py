@@ -54,7 +54,8 @@ class UnitGeneratorAgent:
     def generate(self, change: FileChange, jira_ticket: dict | None = None) -> str:
         prompt = self._build_prompt(change, jira_ticket)
         response = self.llm.generate(self._system_prompt(change.language), prompt)
-        return self.llm.extract_code_block(response, change.language)
+        code = self.llm.extract_code_block(response, change.language)
+        return code
 
     async def generate_streaming(
         self,
@@ -82,7 +83,7 @@ class UnitGeneratorAgent:
     def _detect_framework(self, language: str) -> str:
         return "pytest" if language == "python" else "jest"
 
-    def save_test(self, test_code: str, source_path: str, output_dir: str = "tests") -> str:
+    def save_test(self, test_code: str, source_path: str, output_dir: str = "tests", source_content: str = "") -> str:
         p = Path(source_path)
         stem = p.stem
         ext = ".py" if p.suffix == ".py" else ".test" + p.suffix
@@ -93,7 +94,7 @@ class UnitGeneratorAgent:
         if p.suffix == ".py":
             test_code = self._validate_python(test_code, source_path)
         else:
-            test_code = self._validate_typescript(test_code, source_path)
+            test_code = self._validate_typescript(test_code, source_path, source_content)
 
         out_path.write_text(test_code, encoding="utf-8")
         return str(out_path)
@@ -119,41 +120,90 @@ class UnitGeneratorAgent:
                 f"    pass\n"
             )
 
-    def _validate_typescript(self, code: str, source_path: str) -> str:
-        """Basic structural checks for TypeScript test code."""
-        issues: list[str] = []
+    def _validate_typescript(self, code: str, source_path: str, source_content: str = "") -> str:
+        """Fix common LLM mistakes that produce runtime/compile errors."""
+        import re
 
-        # Check brace balance
-        opens = code.count("{")
-        closes = code.count("}")
-        if opens != closes:
-            issues.append(f"unbalanced braces: {opens} open vs {closes} close")
-
-        # Detect wrong framework imports
-        bad_imports = [
-            "from 'jest'",
-            'from "jest"',
-            "from 'vitest'",
-            'from "vitest"',
-        ]
-        for bad in bad_imports:
-            if bad in code:
+        # 1. Strip bad framework imports (jest/vitest globals are never imported)
+        bad_frameworks = ["jest", "vitest"]
+        for fw in bad_frameworks:
+            if f"from '{fw}'" in code or f'from "{fw}"' in code:
                 logger.warning(
-                    "Generated test for %s imports Jest/Vitest globals — stripping bad import",
-                    source_path,
+                    "Generated test for %s imports %s globals — stripping", source_path, fw
                 )
-                # Remove the entire import line
-                import re
                 code = re.sub(
-                    r"import\s*\{[^}]*\}\s*from\s*['\"](?:jest|vitest)['\"];?\n?",
+                    rf"import\s*\{{[^}}]*\}}\s*from\s*['\"](?:{fw})['\"];?\n?",
                     "",
                     code,
                 )
 
-        if issues:
+        # 2. Fix `clearAllMocks()` called without `jest.` prefix
+        fixed_clear = re.sub(
+            r'(?<!jest\.)(?<!\w)clearAllMocks\s*\(\s*\)',
+            'jest.clearAllMocks()',
+            code,
+        )
+        if fixed_clear != code:
             logger.warning(
-                "TypeScript test for %s has structural issues: %s",
-                source_path, "; ".join(issues),
+                "Generated test for %s called clearAllMocks() without jest. prefix — fixed",
+                source_path,
+            )
+            code = fixed_clear
+
+        # 3. Remove jest.mock() calls that mock the module under test itself.
+        import_paths: list[str] = re.findall(
+            r"""import\s+(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)\s+from\s+['"]([^'"]+)['"]""",
+            code,
+        )
+        def _norm(p: str) -> str:
+            p = p.lstrip("./")
+            for ext in (".ts", ".tsx", ".js", ".jsx"):
+                if p.endswith(ext):
+                    p = p[: -len(ext)]
+            return p.lower()
+
+        normed_imports = {_norm(p) for p in import_paths}
+
+        def _remove_if_self_mock(m: re.Match) -> str:
+            mock_path = m.group(1)
+            if _norm(mock_path) in normed_imports:
+                logger.warning(
+                    "Generated test for %s mocked the module under test (%s) — removing",
+                    source_path, mock_path,
+                )
+                return ""
+            return m.group(0)
+
+        code = re.sub(
+            r"""jest\.mock\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*[^)]+)?\s*\)\s*;?\n?""",
+            _remove_if_self_mock,
+            code,
+        )
+
+        # 4. Remove .toThrow() test blocks when the source has no throw statement.
+        #    The LLM invents throw behaviour for sources that have no error handling.
+        if source_content and "throw" not in source_content:
+            before = code
+            # Remove entire it/test blocks that use .toThrow() or .rejects.toThrow()
+            code = re.sub(
+                r"""\s*(?:it|test)\s*\([^,]+,\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{[^}]*\.toThrow[^}]*\}\s*\)\s*;?""",
+                "",
+                code,
+                flags=re.DOTALL,
+            )
+            if code != before:
+                logger.warning(
+                    "Generated test for %s has .toThrow() assertions but source has no throw — removed",
+                    source_path,
+                )
+
+        # 5. Check brace balance (warn only)
+        opens = code.count("{")
+        closes = code.count("}")
+        if opens != closes:
+            logger.warning(
+                "Generated test for %s has unbalanced braces (%d open vs %d close)",
+                source_path, opens, closes,
             )
 
         return code

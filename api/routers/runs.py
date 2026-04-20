@@ -1,6 +1,8 @@
 import asyncio
 import os
 import json
+import time
+import traceback
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.db.database import get_db
@@ -50,8 +52,81 @@ async def _run_pipeline(run_id: str, req: TriggerRequest):
     from api.services import run_service as svc
     from api.ws_manager import manager as ws_manager
 
+    live_console_logs: list[dict] = []
+    latest_result = {"passed": 0, "failed": 0, "skipped": 0, "duration_seconds": 0.0}
+    flush_interval = max(1.0, float(os.environ.get("AITA_RUN_PROGRESS_FLUSH_SECONDS", "2")))
+    last_flush_at = 0.0
+
+    def _event_to_console_log(event: dict) -> dict | None:
+        etype = event.get("type")
+        if etype == "test_log":
+            return {
+                "source": event.get("source", "test"),
+                "stdout": event.get("stdout", "") or "",
+                "stderr": event.get("stderr", "") or "",
+                "passed": int(event.get("passed", 0) or 0),
+                "failed": int(event.get("failed", 0) or 0),
+                "skipped": int(event.get("skipped", 0) or 0),
+                "exit_code": int(event.get("exit_code", 0) or 0),
+            }
+        if etype == "progress":
+            node = str(event.get("node") or "pipeline")
+            status = str(event.get("status") or "started")
+            message = str(event.get("message") or status)
+            return {
+                "source": f"[{node}]",
+                "stdout": "",
+                "stderr": f"{status.upper()}: {message}",
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "exit_code": 1 if status == "error" else 0,
+            }
+        if etype == "error":
+            return {
+                "source": "[pipeline]",
+                "stdout": "",
+                "stderr": str(event.get("message") or "Pipeline error"),
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "exit_code": 1,
+            }
+        return None
+
+    async def _flush_progress(force: bool = False) -> None:
+        nonlocal last_flush_at
+        if not force and (time.monotonic() - last_flush_at) < flush_interval:
+            return
+        last_flush_at = time.monotonic()
+        try:
+            async with SessionLocal() as db:
+                await svc.update_run(
+                    db,
+                    run_id,
+                    passed=latest_result["passed"],
+                    failed=latest_result["failed"],
+                    skipped=latest_result["skipped"],
+                    duration_seconds=latest_result["duration_seconds"],
+                    console_output=json.dumps(live_console_logs[-500:]),
+                )
+        except Exception as exc:
+            logger.debug("Progress flush failed for run %s: %s", run_id, exc)
+
     async def on_event(event: dict) -> None:
         await ws_manager.broadcast(run_id, event)
+        entry = _event_to_console_log(event)
+        if entry is not None:
+            live_console_logs.append(entry)
+
+        if event.get("type") == "run_result":
+            latest_result["passed"] = int(event.get("passed", 0) or 0)
+            latest_result["failed"] = int(event.get("failed", 0) or 0)
+            latest_result["skipped"] = int(event.get("skipped", 0) or 0)
+            latest_result["duration_seconds"] = float(event.get("duration", 0.0) or 0.0)
+
+        if entry is not None or event.get("type") == "run_result":
+            await _flush_progress()
 
     logger.info("Pipeline starting — run_id=%s repo=%s pr=%s branch=%s sha=%s",
                 run_id, req.repo, req.pr_number, req.branch, req.commit_sha[:12] if req.commit_sha else "?")
@@ -71,7 +146,7 @@ async def _run_pipeline(run_id: str, req: TriggerRequest):
         run_results  = final_state.get("run_results") or {}
         generated    = final_state.get("generated_tests") or {}
         debug_raw    = final_state.get("debug_results") or []
-        console_logs = final_state.get("console_logs") or []
+        console_logs = final_state.get("console_logs") or live_console_logs
         report       = final_state.get("report")
         error_msg    = final_state.get("error")
 
@@ -124,9 +199,21 @@ async def _run_pipeline(run_id: str, req: TriggerRequest):
         ws_manager.clear_buffer(run_id)
         raise
     except Exception as exc:
-        logger.error("Pipeline failed for run %s: %s", run_id, exc)
+        logger.error("Pipeline failed for run %s: %s", run_id, exc, exc_info=True)
+        trace = traceback.format_exc()
+        error_payload = f"{exc}\n\n{trace}"[:16000]
         async with SessionLocal() as db:
-            await svc.update_run(db, run_id, status="error", error_message=str(exc))
+            await svc.update_run(
+                db,
+                run_id,
+                status="error",
+                error_message=error_payload,
+                passed=latest_result["passed"],
+                failed=latest_result["failed"],
+                skipped=latest_result["skipped"],
+                duration_seconds=latest_result["duration_seconds"],
+                console_output=json.dumps(live_console_logs[-500:]),
+            )
         await on_event({"type": "error", "message": str(exc)})
         ws_manager.clear_buffer(run_id)
 
@@ -147,6 +234,7 @@ async def restart_run(run_id: str, db: AsyncSession = Depends(get_db)):
         error_message=None,
         generated_tests=None,
         debug_results=None,
+        console_output=None,
         report=None,
     )
     req = TriggerRequest(

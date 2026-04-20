@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import clsx from 'clsx'
-import { ArrowLeft, RefreshCw, Terminal, ChevronDown, ChevronRight, CheckCircle2, XCircle } from 'lucide-react'
+import { ArrowLeft, RefreshCw, Terminal, ChevronDown, ChevronRight, CheckCircle2, XCircle, Loader } from 'lucide-react'
 import { useRunWebSocket } from '../hooks/useRunWebSocket'
 import { getRun, restartRun } from '../api/client'
 import Markdown from '../components/Markdown'
@@ -41,12 +41,16 @@ const _runUICache = new Map<string, CachedRunUIState>()
 const PIPELINE_NODES = [
   { id: 'fetch_jira',           label: 'Fetch Jira' },
   { id: 'analyze',              label: 'Analyze Changes' },
+  { id: 'risk_score',           label: 'Score Risk' },
   { id: 'clone_repo',           label: 'Clone Repository' },
   { id: 'setup_workspace',      label: 'Setup Workspace' },
   { id: 'generate_unit',        label: 'Generate Unit Tests' },
   { id: 'generate_integration', label: 'Generate Integration Tests' },
   { id: 'generate_e2e',         label: 'Generate E2E Tests' },
   { id: 'run_tests',            label: 'Run Tests' },
+  { id: 'node_heal',            label: 'Self-Heal Failing Tests' },
+  { id: 'mutation_test',        label: 'Run Mutation Tests' },
+  { id: 'score_quality',        label: 'Score Test Quality' },
   { id: 'debug',                label: 'Debug Failures' },
   { id: 'reporter',             label: 'Build Report' },
   { id: 'cleanup',              label: 'Cleanup' },
@@ -134,11 +138,12 @@ function DevConsole({ logs }: { logs: ConsoleLog[] }) {
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
   const consoleRef = useRef<HTMLDivElement>(null)
 
-  // Auto-scroll when new logs arrive
+  // Auto-scroll on new rows OR when streaming appends to an existing row
+  const totalOutputChars = logs.reduce((s, l) => s + l.stdout.length + l.stderr.length, 0)
   useEffect(() => {
     if (open && consoleRef.current)
       consoleRef.current.scrollTop = consoleRef.current.scrollHeight
-  }, [logs.length, open])
+  }, [logs.length, totalOutputChars, open])
 
   function toggle(i: number) {
     setExpanded((prev) => ({ ...prev, [i]: !prev[i] }))
@@ -181,7 +186,9 @@ function DevConsole({ logs }: { logs: ConsoleLog[] }) {
                   >
                     {ok
                       ? <CheckCircle2 size={12} className="flex-shrink-0 text-green-400" />
-                      : <XCircle      size={12} className="flex-shrink-0 text-red-400"   />
+                      : log.exit_code === -1
+                        ? <Loader      size={12} className="flex-shrink-0 text-yellow-400 animate-spin" />
+                        : <XCircle     size={12} className="flex-shrink-0 text-red-400"   />
                     }
                     <span className="flex-1 truncate text-gray-300">{log.source}</span>
                     <span className="flex items-center gap-3 text-gray-500 flex-shrink-0">
@@ -317,15 +324,38 @@ export default function RunDetail() {
           setDebugEntries((prev) => [...prev, event])
           break
         case 'test_log':
-          setConsoleLogs((prev) => [...prev, {
-            source:    event.source,
-            stdout:    event.stdout,
-            stderr:    event.stderr,
-            passed:    event.passed,
-            failed:    event.failed,
-            skipped:   event.skipped,
-            exit_code: event.exit_code,
-          }])
+          setConsoleLogs((prev) => {
+            const incoming: ConsoleLog = {
+              source:    event.source,
+              stdout:    event.stdout   ?? '',
+              stderr:    event.stderr   ?? '',
+              passed:    event.passed   ?? 0,
+              failed:    event.failed   ?? 0,
+              skipped:   event.skipped  ?? 0,
+              exit_code: event.exit_code ?? 0,
+            }
+            const idx = prev.findIndex((l) => l.source === event.source)
+            if (idx === -1) {
+              // First event for this file — create a new row
+              return [...prev, incoming]
+            }
+            const existing = prev[idx]
+            if (existing.exit_code !== -1) {
+              // Already have a final result (e.g. heal re-run) — append a new row
+              return [...prev, incoming]
+            }
+            if (incoming.exit_code === -1) {
+              // Streaming chunk: accumulate output into the existing in-progress row
+              const merged: ConsoleLog = {
+                ...existing,
+                stdout: (existing.stdout || '') + (incoming.stdout || ''),
+                stderr: (existing.stderr || '') + (incoming.stderr || ''),
+              }
+              return [...prev.slice(0, idx), merged, ...prev.slice(idx + 1)]
+            }
+            // Final result for this file — replace the streaming row with complete data
+            return [...prev.slice(0, idx), incoming, ...prev.slice(idx + 1)]
+          })
           break
         case 'complete':
           setFinalStatus(event.status)
@@ -358,6 +388,7 @@ export default function RunDetail() {
   const isStale = restRun?.status === 'running'
     && !isConnected
     && events.length === 0
+    && (restRun.console_output?.length ?? 0) === 0
     && restRun?.error_message == null
 
   async function handleRestart() {
